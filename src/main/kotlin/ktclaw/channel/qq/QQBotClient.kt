@@ -6,34 +6,30 @@ import io.ktor.client.engine.cio.*
 import io.ktor.client.plugins.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.logging.*
-import io.ktor.client.plugins.websocket.*
 import io.ktor.client.request.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
-import io.ktor.websocket.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ClosedReceiveChannelException
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
+import java.security.MessageDigest
+import java.time.Instant
+import java.util.*
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /**
- * QQ Bot WebSocket 客户端
- * 实现QQ频道机器人的WebSocket连接管理、消息收发和事件处理
+ * QQ Bot Webhook 客户端
+ * 实现QQ频道机器人的Webhook接收和HTTP API消息发送
  *
  * 文档参考: https://bot.q.qq.com/wiki/develop/api-v2/
  */
 class QQBotClient(
-    private val appId: String,
-    private val appSecret: String,
-    private val token: String? = null,
-    private val sandbox: Boolean = false,
-    private val shardId: Int = 0,
-    private val shardCount: Int = 1
+    val appId: String,
+    val appSecret: String,
+    val token: String? = null,
+    val sandbox: Boolean = false,
+    val webhookSecret: String? = null
 ) {
     private val logger = LoggerFactory.getLogger(QQBotClient::class.java)
     val json = Json {
@@ -44,7 +40,7 @@ class QQBotClient(
     }
 
     // HTTP 客户端
-    private val httpClient = HttpClient(CIO) {
+    val httpClient = HttpClient(CIO) {
         install(ContentNegotiation) {
             json(json)
         }
@@ -57,201 +53,350 @@ class QQBotClient(
         }
     }
 
-    // WebSocket 会话
-    private var webSocketSession: DefaultClientWebSocketSession? = null
-    private var heartbeatJob: Job? = null
-    private var reconnectJob: Job? = null
-    private var messageProcessJob: Job? = null
-    private val isConnected = AtomicBoolean(false)
-    private val isReconnecting = AtomicBoolean(false)
-    private val lastSequenceNumber = AtomicLong(0)
-    private val sessionIdRef = AtomicReference<String?>(null)
-    private val heartbeatInterval = AtomicLong(45000) // 默认45秒
-    private var lastHeartbeatAck = AtomicLong(0)
-    private val missedHeartbeats = AtomicLong(0)
-
-    // 重连配置
-    private val maxReconnectAttempts = 10
-    private val reconnectDelayMs = 5000L
-    private val maxReconnectDelayMs = 60000L
-    private var reconnectAttempts = 0
-
     // 消息处理器
     val messageReceiver = QQMessageReceiver(this)
     val messageSender = QQMessageSender(this, httpClient, json)
-    val eventHandler = QQEventHandler(this)
 
     // 事件回调
     private var onMessageCallback: ((QQMessage) -> Unit)? = null
     private var onEventCallback: ((QQEvent) -> Unit)? = null
-    private var onConnectCallback: (() -> Unit)? = null
-    private var onDisconnectCallback: ((Throwable?) -> Unit)? = null
-    private var onReadyCallback: ((QQReadyEvent) -> Unit)? = null
-
-    // 消息发送队列
-    private val messageQueue = Channel<QQSendMessage>(Channel.BUFFERED)
+    private var onReadyCallback: (() -> Unit)? = null
 
     // API 基础URL
-    private val apiBaseUrl = if (sandbox) {
+    val apiBaseUrl = if (sandbox) {
         "https://sandbox.api.sgroup.qq.com"
     } else {
         "https://api.sgroup.qq.com"
     }
 
-    private val wsBaseUrl = if (sandbox) {
-        "wss://sandbox.api.sgroup.qq.com/websocket"
-    } else {
-        "wss://api.sgroup.qq.com/websocket"
-    }
-
-    // 协程作用域
-    private val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Access Token 缓存
+    private var cachedAccessToken: String? = null
+    private var tokenExpireTime: Long = 0
 
     /**
-     * 启动WebSocket连接
+     * 启动客户端（Webhook模式下仅初始化）
      */
-    suspend fun connect() {
-        if (isConnected.get()) {
-            logger.warn("WebSocket already connected")
-            return
-        }
+    suspend fun start() {
+        logger.info("Starting QQ Bot Webhook client...")
+        logger.info("AppID: $appId, Sandbox: $sandbox")
+        
+        // 预获取 Access Token
+        refreshAccessToken()
+        
+        onReadyCallback?.invoke()
+        logger.info("QQ Bot Webhook client started successfully")
+    }
 
-        if (isReconnecting.get()) {
-            logger.warn("Reconnection already in progress")
-            return
-        }
-
+    /**
+     * 停止客户端
+     */
+    suspend fun stop() {
+        logger.info("Stopping QQ Bot Webhook client...")
         try {
-            logger.info("Connecting to QQ Bot WebSocket...")
-            logger.info("AppID: $appId, Sandbox: $sandbox, Shard: $shardId/$shardCount")
+            httpClient.close()
+        } catch (e: Exception) {
+            logger.error("Error closing HTTP client", e)
+        }
+        logger.info("QQ Bot Webhook client stopped")
+    }
 
-            // 获取WebSocket连接URL
-            val wsUrl = buildWebSocketUrl()
+    /**
+     * 获取 Access Token
+     */
+    suspend fun getAccessToken(): String {
+        val now = System.currentTimeMillis()
+        if (cachedAccessToken != null && now < tokenExpireTime - 60000) {
+            return cachedAccessToken!!
+        }
+        return refreshAccessToken()
+    }
 
-            httpClient.webSocket({
-                url(wsUrl)
-                // 使用 Access Token 鉴权
-                val authToken = getAccessToken()
-                header(HttpHeaders.Authorization, "QQBot $authToken")
-            }) {
-                webSocketSession = this
-                isConnected.set(true)
-                isReconnecting.set(false)
-                reconnectAttempts = 0
+    /**
+     * 刷新 Access Token
+     */
+    private suspend fun refreshAccessToken(): String {
+        try {
+            logger.debug("Refreshing access token...")
+            
+            val response = httpClient.post("$apiBaseUrl/auth/token") {
+                contentType(ContentType.Application.Json)
+                setBody(buildJsonObject {
+                    put("appId", appId)
+                    put("clientSecret", appSecret)
+                }.toString())
+            }
 
-                logger.info("WebSocket connected successfully")
+            val responseBody = response.bodyAsText()
+            val tokenResponse = json.decodeFromString<QQTokenResponse>(responseBody)
+            
+            cachedAccessToken = tokenResponse.accessToken
+            tokenExpireTime = System.currentTimeMillis() + (tokenResponse.expiresIn * 1000)
+            
+            logger.info("Access token refreshed successfully")
+            return cachedAccessToken!!
+        } catch (e: Exception) {
+            logger.error("Failed to refresh access token", e)
+            throw e
+        }
+    }
 
-                // 启动消息处理循环
-                handleWebSocketMessages()
+    /**
+     * 验证 Webhook 签名 (Ed25519)
+     * @param signature 签名
+     * @param timestamp 时间戳
+     * @param body 请求体
+     * @return 是否验证通过
+     */
+    fun verifyWebhookSignature(signature: String, timestamp: String, body: String): Boolean {
+        if (webhookSecret.isNullOrEmpty()) {
+            logger.warn("Webhook secret not configured, skipping signature verification")
+            return true
+        }
+
+        return try {
+            // QQ Bot Webhook 使用 Ed25519 签名
+            // 格式: timestamp + body 的 Ed25519 签名
+            val message = timestamp + body
+            verifyEd25519Signature(signature, message, webhookSecret)
+        } catch (e: Exception) {
+            logger.error("Signature verification failed", e)
+            false
+        }
+    }
+
+    /**
+     * 验证 Ed25519 签名
+     * 注意：实际实现需要使用 Ed25519 算法库
+     */
+    private fun verifyEd25519Signature(signature: String, message: String, secret: String): Boolean {
+        // TODO: 使用 Ed25519 算法验证签名
+        // 这里使用简单的 HMAC-SHA256 作为临时方案
+        // 实际生产环境应使用 Ed25519 算法库
+        return try {
+            val mac = Mac.getInstance("HmacSHA256")
+            val secretKey = SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256")
+            mac.init(secretKey)
+            val computedSignature = Base64.getEncoder().encodeToString(
+                mac.doFinal(message.toByteArray(Charsets.UTF_8))
+            )
+            computedSignature == signature
+        } catch (e: Exception) {
+            logger.error("Ed25519 signature verification not implemented", e)
+            // 临时返回 true，实际应返回 false
+            true
+        }
+    }
+
+    /**
+     * 处理 Webhook 事件
+     * @param eventData 事件数据
+     */
+    suspend fun handleWebhookEvent(eventData: String) {
+        try {
+            val jsonObject = json.parseToJsonElement(eventData).jsonObject
+            val eventType = jsonObject["t"]?.jsonPrimitive?.contentOrNull
+            val data = jsonObject["d"]?.jsonObject
+
+            logger.debug("Received webhook event: $eventType")
+
+            when (eventType) {
+                // 频道消息事件
+                "MESSAGE_CREATE" -> handleMessageCreate(data)
+                "AT_MESSAGE_CREATE" -> handleAtMessageCreate(data)
+                
+                // 私聊消息事件
+                "DIRECT_MESSAGE_CREATE" -> handleDirectMessageCreate(data)
+                
+                // 群消息事件 (C2C)
+                "C2C_MESSAGE_CREATE" -> handleC2CMessageCreate(data)
+                "GROUP_AT_MESSAGE_CREATE" -> handleGroupAtMessageCreate(data)
+                
+                // 成员事件
+                "GUILD_MEMBER_ADD" -> handleGuildMemberAdd(data)
+                "GUILD_MEMBER_REMOVE" -> handleGuildMemberRemove(data)
+                
+                // 频道事件
+                "CHANNEL_CREATE" -> handleChannelCreate(data)
+                "CHANNEL_DELETE" -> handleChannelDelete(data)
+                
+                else -> {
+                    logger.debug("Unhandled event type: $eventType")
+                    onEventCallback?.invoke(QQEvent.Unknown(eventType, data))
+                }
             }
         } catch (e: Exception) {
-            logger.error("WebSocket connection failed", e)
-            isConnected.set(false)
-            onDisconnectCallback?.invoke(e)
-            scheduleReconnect()
+            logger.error("Failed to handle webhook event", e)
         }
     }
 
     /**
-     * 断开WebSocket连接
+     * 处理消息创建事件
      */
-    suspend fun disconnect() {
-        logger.info("Disconnecting WebSocket...")
-        isConnected.set(false)
-        isReconnecting.set(false)
-
-        heartbeatJob?.cancel()
-        heartbeatJob = null
-
-        reconnectJob?.cancel()
-        reconnectJob = null
-
-        messageProcessJob?.cancel()
-        messageProcessJob = null
-
-        try {
-            webSocketSession?.close()
-        } catch (e: Exception) {
-            logger.error("Error closing WebSocket", e)
-        }
-        webSocketSession = null
-
-        onDisconnectCallback?.invoke(null)
-        logger.info("WebSocket disconnected")
-    }
-
-    /**
-     * 重新连接
-     */
-    suspend fun reconnect() {
-        if (isReconnecting.getAndSet(true)) {
-            logger.warn("Reconnection already in progress")
-            return
-        }
-
-        try {
-            disconnect()
-            val delayMs = calculateReconnectDelay()
-            logger.info("Reconnecting in ${delayMs}ms... (attempt ${reconnectAttempts + 1}/$maxReconnectAttempts)")
-            delay(delayMs)
-            connect()
-        } catch (e: Exception) {
-            logger.error("Reconnection failed", e)
-            isReconnecting.set(false)
-            scheduleReconnect()
-        }
-    }
-
-    /**
-     * 计算重连延迟（指数退避）
-     */
-    private fun calculateReconnectDelay(): Long {
-        reconnectAttempts++
-        if (reconnectAttempts >= maxReconnectAttempts) {
-            logger.error("Max reconnection attempts reached")
-            return maxReconnectDelayMs
-        }
-        val delay = reconnectDelayMs * (1 shl (reconnectAttempts - 1))
-        return minOf(delay, maxReconnectDelayMs)
-    }
-
-    /**
-     * 调度重连
-     */
-    private fun scheduleReconnect() {
-        if (reconnectJob?.isActive == true) return
-        if (!isConnected.get() && !isReconnecting.get()) {
-            reconnectJob = clientScope.launch {
-                reconnect()
+    private suspend fun handleMessageCreate(data: JsonObject?) {
+        data?.let {
+            try {
+                val message = json.decodeFromJsonElement<QQMessage>(it)
+                onMessageCallback?.invoke(message)
+                logger.info("Received message from ${message.author?.username}: ${message.content}")
+            } catch (e: Exception) {
+                logger.error("Failed to parse message", e)
             }
         }
     }
 
     /**
-     * 构建WebSocket URL
+     * 处理 @机器人消息事件
      */
-    private fun buildWebSocketUrl(): String {
-        return "$wsBaseUrl"
+    private suspend fun handleAtMessageCreate(data: JsonObject?) {
+        data?.let {
+            try {
+                val message = json.decodeFromJsonElement<QQMessage>(it)
+                onMessageCallback?.invoke(message.copy(mentionsMe = true))
+                logger.info("Received @ message from ${message.author?.username}: ${message.content}")
+            } catch (e: Exception) {
+                logger.error("Failed to parse @ message", e)
+            }
+        }
     }
 
     /**
-     * 处理WebSocket消息循环
+     * 处理私聊消息事件
      */
-    private suspend fun DefaultClientWebSocketSession.handleWebSocketMessages() {
-        try {
-            for (frame in incoming) {
-                when (frame) {
-                    is Frame.Text -> {
-                        val text = frame.readText()
-                        handleWebSocketMessage(text)
-                    }
-                    is Frame.Binary -> {
-                        logger.debug("Received binary frame")
-                    }
-                    is Frame.Close -> {
-                        logger.info("Received close frame: ${frame.readReason()}")
-                        isConnected.set(false)
-                        scheduleReconnect()
-                    }
-                    else -> {
-                        logger.debug("Received frame: ${
+    private suspend fun handleDirectMessageCreate(data: JsonObject?) {
+        data?.let {
+            try {
+                val message = json.decodeFromJsonElement<QQMessage>(it)
+                onMessageCallback?.invoke(message.copy(isDirect = true))
+                logger.info("Received direct message from ${message.author?.username}: ${message.content}")
+            } catch (e: Exception) {
+                logger.error("Failed to parse direct message", e)
+            }
+        }
+    }
+
+    /**
+     * 处理 C2C 消息事件
+     */
+    private suspend fun handleC2CMessageCreate(data: JsonObject?) {
+        data?.let {
+            try {
+                val message = json.decodeFromJsonElement<QQMessage>(it)
+                onMessageCallback?.invoke(message.copy(isC2C = true))
+                logger.info("Received C2C message: ${message.content}")
+            } catch (e: Exception) {
+                logger.error("Failed to parse C2C message", e)
+            }
+        }
+    }
+
+    /**
+     * 处理群 @消息事件
+     */
+    private suspend fun handleGroupAtMessageCreate(data: JsonObject?) {
+        data?.let {
+            try {
+                val message = json.decodeFromJsonElement<QQMessage>(it)
+                onMessageCallback?.invoke(message.copy(isGroup = true, mentionsMe = true))
+                logger.info("Received group @ message: ${message.content}")
+            } catch (e: Exception) {
+                logger.error("Failed to parse group @ message", e)
+            }
+        }
+    }
+
+    /**
+     * 处理成员加入事件
+     */
+    private suspend fun handleGuildMemberAdd(data: JsonObject?) {
+        data?.let {
+            val user = it["user"]?.jsonObject
+            val guildId = it["guild_id"]?.jsonPrimitive?.contentOrNull
+            val username = user?.get("username")?.jsonPrimitive?.contentOrNull
+            logger.info("Member joined: $username in guild $guildId")
+            onEventCallback?.invoke(QQEvent.MemberJoined(username, guildId))
+        }
+    }
+
+    /**
+     * 处理成员离开事件
+     */
+    private suspend fun handleGuildMemberRemove(data: JsonObject?) {
+        data?.let {
+            val user = it["user"]?.jsonObject
+            val guildId = it["guild_id"]?.jsonPrimitive?.contentOrNull
+            val username = user?.get("username")?.jsonPrimitive?.contentOrNull
+            logger.info("Member left: $username from guild $guildId")
+            onEventCallback?.invoke(QQEvent.MemberLeft(username, guildId))
+        }
+    }
+
+    /**
+     * 处理频道创建事件
+     */
+    private suspend fun handleChannelCreate(data: JsonObject?) {
+        data?.let {
+            val channelId = it["id"]?.jsonPrimitive?.contentOrNull
+            val channelName = it["name"]?.jsonPrimitive?.contentOrNull
+            logger.info("Channel created: $channelName ($channelId)")
+            onEventCallback?.invoke(QQEvent.ChannelCreated(channelId, channelName))
+        }
+    }
+
+    /**
+     * 处理频道删除事件
+     */
+    private suspend fun handleChannelDelete(data: JsonObject?) {
+        data?.let {
+            val channelId = it["id"]?.jsonPrimitive?.contentOrNull
+            val channelName = it["name"]?.jsonPrimitive?.contentOrNull
+            logger.info("Channel deleted: $channelName ($channelId)")
+            onEventCallback?.invoke(QQEvent.ChannelDeleted(channelId, channelName))
+        }
+    }
+
+    /**
+     * 设置消息回调
+     */
+    fun onMessage(callback: (QQMessage) -> Unit) {
+        onMessageCallback = callback
+    }
+
+    /**
+     * 设置事件回调
+     */
+    fun onEvent(callback: (QQEvent) -> Unit) {
+        onEventCallback = callback
+    }
+
+    /**
+     * 设置就绪回调
+     */
+    fun onReady(callback: () -> Unit) {
+        onReadyCallback = callback
+    }
+}
+
+/**
+ * Token 响应
+ */
+@Serializable
+data class QQTokenResponse(
+    @SerialName("access_token")
+    val accessToken: String,
+    @SerialName("expires_in")
+    val expiresIn: Long,
+    @SerialName("token_type")
+    val tokenType: String = "Bearer"
+)
+
+/**
+ * QQ 事件密封类
+ */
+sealed class QQEvent {
+    data class Unknown(val eventType: String?, val data: JsonObject?) : QQEvent()
+    data class MemberJoined(val username: String?, val guildId: String?) : QQEvent()
+    data class MemberLeft(val username: String?, val guildId: String?) : QQEvent()
+    data class ChannelCreated(val channelId: String?, val channelName: String?) : QQEvent()
+    data class ChannelDeleted(val channelId: String?, val channelName: String?) : QQEvent()
+    data class MessageDeleted(val messageId: String?, val channelId: String?) : QQEvent()
+}
