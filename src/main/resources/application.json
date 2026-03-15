@@ -1,0 +1,49 @@
+{
+  "ktor": {
+    "deployment": {
+      "port": 8080,
+      "host": "0.0.0.0"
+    },
+    "application": {
+      "modules": [
+        "ktclaw.ApplicationKt.module"
+      ]
+    }
+  },
+  "database": {
+    "driver": "org.postgresql.Driver",
+    "url": "jdbc:postgresql://localhost:5432/ktclaw",
+    "user": "ktclaw",
+    "password": "password",
+    "pool": {
+      "maxSize": 10,
+      "minIdle": 2,
+      "connectionTimeout": 30000,
+      "idleTimeout": 600000,
+      "maxLifetime": 1800000
+    }
+  },
+  "websocket": {
+    "pingPeriodMillis": 15000,
+    "timeoutMillis": 15000,
+    "maxFrameSize": 65536,
+    "masking": false
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "security": {
+    "jwt": {
+      "secret": "your-secret-key-change-in-production",
+      "issuer": "ktclaw",
+      "audience": "ktclaw-api",
+      "realm": "KtClaw API",
+      "expiration": 86400000
+    }
+  },
+  "features": {
+    "websockets": true,
+    "authentication": true,
+    "rateLimiting": true
+  }
+}
