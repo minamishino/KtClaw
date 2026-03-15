@@ -9,14 +9,10 @@ import io.ktor.client.plugins.logging.*
 import io.ktor.client.request.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
-import kotlinx.coroutines.*
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import org.slf4j.LoggerFactory
-import java.security.MessageDigest
-import java.time.Instant
-import java.util.*
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
 /**
  * QQ Bot Webhook 客户端
@@ -28,8 +24,7 @@ class QQBotClient(
     val appId: String,
     val appSecret: String,
     val token: String? = null,
-    val sandbox: Boolean = false,
-    val webhookSecret: String? = null
+    val sandbox: Boolean = false
 ) {
     private val logger = LoggerFactory.getLogger(QQBotClient::class.java)
     val json = Json {
@@ -137,53 +132,6 @@ class QQBotClient(
         } catch (e: Exception) {
             logger.error("Failed to refresh access token", e)
             throw e
-        }
-    }
-
-    /**
-     * 验证 Webhook 签名 (Ed25519)
-     * @param signature 签名
-     * @param timestamp 时间戳
-     * @param body 请求体
-     * @return 是否验证通过
-     */
-    fun verifyWebhookSignature(signature: String, timestamp: String, body: String): Boolean {
-        if (webhookSecret.isNullOrEmpty()) {
-            logger.warn("Webhook secret not configured, skipping signature verification")
-            return true
-        }
-
-        return try {
-            // QQ Bot Webhook 使用 Ed25519 签名
-            // 格式: timestamp + body 的 Ed25519 签名
-            val message = timestamp + body
-            verifyEd25519Signature(signature, message, webhookSecret)
-        } catch (e: Exception) {
-            logger.error("Signature verification failed", e)
-            false
-        }
-    }
-
-    /**
-     * 验证 Ed25519 签名
-     * 注意：实际实现需要使用 Ed25519 算法库
-     */
-    private fun verifyEd25519Signature(signature: String, message: String, secret: String): Boolean {
-        // TODO: 使用 Ed25519 算法验证签名
-        // 这里使用简单的 HMAC-SHA256 作为临时方案
-        // 实际生产环境应使用 Ed25519 算法库
-        return try {
-            val mac = Mac.getInstance("HmacSHA256")
-            val secretKey = SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256")
-            mac.init(secretKey)
-            val computedSignature = Base64.getEncoder().encodeToString(
-                mac.doFinal(message.toByteArray(Charsets.UTF_8))
-            )
-            computedSignature == signature
-        } catch (e: Exception) {
-            logger.error("Ed25519 signature verification not implemented", e)
-            // 临时返回 true，实际应返回 false
-            true
         }
     }
 

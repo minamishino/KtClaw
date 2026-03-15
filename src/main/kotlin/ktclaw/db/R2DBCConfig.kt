@@ -4,60 +4,38 @@ import io.r2dbc.pool.PoolingConnectionFactoryProvider
 import io.r2dbc.spi.ConnectionFactories
 import io.r2dbc.spi.ConnectionFactory
 import io.r2dbc.spi.ConnectionFactoryOptions
-import kotlinx.coroutines.reactive.awaitSingle
-import org.jetbrains.exposed.sql.Database
-import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
-import org.springframework.beans.factory.annotation.Value
-import org.springframework.context.annotation.Bean
-import org.springframework.context.annotation.Configuration
-import org.springframework.core.io.ClassPathResource
-import org.springframework.data.r2dbc.config.AbstractR2dbcConfiguration
-import org.springframework.data.r2dbc.repository.config.EnableR2dbcRepositories
-import org.springframework.r2dbc.connection.init.ResourceDatabasePopulator
 import io.r2dbc.postgresql.PostgresqlConnectionFactoryProvider
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.reactive.asFlow
+import kotlinx.coroutines.reactive.awaitFirstOrNull
+import kotlinx.coroutines.reactive.awaitSingle
+import org.springframework.data.r2dbc.core.DatabaseClient
+import org.springframework.r2dbc.core.awaitOneOrNull
+import org.springframework.r2dbc.core.awaitRowsUpdated
+import org.springframework.r2dbc.core.flow
 import java.time.Duration
 
 /**
  * KtClaw R2DBC Configuration
- * 支持响应式数据库访问 + Exposed ORM
+ * 支持响应式数据库访问 + Exposed ORM + R2DBC DatabaseClient
  */
-@Configuration
-@EnableR2dbcRepositories(basePackages = ["ktclaw.db.repository"])
-class R2DBCConfig : AbstractR2dbcConfiguration() {
-
-    @Value("\${spring.r2dbc.host:localhost}")
-    private lateinit var host: String
-
-    @Value("\${spring.r2dbc.port:5432}")
-    private var port: Int = 5432
-
-    @Value("\${spring.r2dbc.database:ktclaw}")
-    private lateinit var database: String
-
-    @Value("\${spring.r2dbc.username:ktclaw}")
-    private lateinit var username: String
-
-    @Value("\${spring.r2dbc.password:}")
-    private lateinit var password: String
-
-    @Value("\${spring.r2dbc.pool.initial-size:10}")
-    private var initialSize: Int = 10
-
-    @Value("\${spring.r2dbc.pool.max-size:50}")
-    private var maxSize: Int = 50
-
-    @Value("\${spring.r2dbc.pool.max-idle-time:30}")
-    private var maxIdleTimeMinutes: Long = 30
-
-    @Value("\${spring.r2dbc.pool.max-acquire-time:30}")
-    private var maxAcquireTimeSeconds: Long = 30
+class R2DBCConfig(
+    private val host: String = System.getenv("DB_HOST") ?: "localhost",
+    private val port: Int = System.getenv("DB_PORT")?.toIntOrNull() ?: 5432,
+    private val database: String = System.getenv("DB_NAME") ?: "ktclaw",
+    private val username: String = System.getenv("DB_USER") ?: "ktclaw",
+    private val password: String = System.getenv("DB_PASSWORD") ?: "",
+    private val initialSize: Int = 10,
+    private val maxSize: Int = 50,
+    private val maxIdleTimeMinutes: Long = 30,
+    private val maxAcquireTimeSeconds: Long = 30
+) {
 
     /**
      * R2DBC Connection Factory with Connection Pooling
      */
-    @Bean
-    override fun connectionFactory(): ConnectionFactory {
-        return ConnectionFactories.get(
+    val connectionFactory: ConnectionFactory by lazy {
+        ConnectionFactories.get(
             ConnectionFactoryOptions.builder()
                 .option(ConnectionFactoryOptions.DRIVER, "pool")
                 .option(ConnectionFactoryOptions.PROTOCOL, "postgresql")
@@ -83,90 +61,96 @@ class R2DBCConfig : AbstractR2dbcConfiguration() {
     }
 
     /**
-     * Exposed Database Configuration
-     * 用于同步/阻塞式操作（如 Flyway 迁移）
+     * Spring Data R2DBC DatabaseClient
      */
-    @Bean
-    fun exposedDatabase(): Database {
-        return Database.connect(
-            url = "jdbc:postgresql://$host:$port/$database",
-            driver = "org.postgresql.Driver",
-            user = username,
-            password = password
-        )
-    }
-
-    /**
-     * Database initializer for schema.sql
-     */
-    @Bean
-    fun databaseInitializer(): DatabaseInitializer {
-        return DatabaseInitializer(connectionFactory())
+    val databaseClient: DatabaseClient by lazy {
+        DatabaseClient.create(connectionFactory)
     }
 }
 
 /**
- * Database Initializer
- * 用于初始化数据库 schema
+ * R2DBC Repository Base Class with suspend functions and Flow support
  */
-class DatabaseInitializer(private val connectionFactory: ConnectionFactory) {
+abstract class R2DBCRepository(private val databaseClient: DatabaseClient) {
 
     /**
-     * 初始化数据库（如果不使用 Flyway）
+     * 执行查询并返回单个结果
      */
-    suspend fun initialize() {
-        val populator = ResourceDatabasePopulator(
-            ClassPathResource("schema.sql")
-        )
-        populator.populate(connectionFactory).awaitSingle()
-    }
-
-    /**
-     * 执行自定义 SQL 脚本
-     */
-    suspend fun executeScript(resourcePath: String) {
-        val populator = ResourceDatabasePopulator(
-            ClassPathResource(resourcePath)
-        )
-        populator.populate(connectionFactory).awaitSingle()
-    }
-}
-
-/**
- * R2DBC Transaction Helper
- * 用于在协程中进行数据库事务操作
- */
-object R2DBCTransaction {
-
-    /**
-     * 在事务中执行 Exposed 操作
-     */
-    suspend fun <T> transactional(block: suspend () -> T): T {
-        return newSuspendedTransaction {
-            block()
+    protected suspend inline fun <reified T : Any> fetchOne(sql: String, bind: Map<String, Any> = emptyMap()): T? {
+        var spec = databaseClient.sql(sql)
+        bind.forEach { (key, value) ->
+            spec = spec.bind(key, value)
         }
+        return spec.map { row, _ ->
+            mapRowToType<T>(row)
+        }.awaitOneOrNull()
     }
 
     /**
-     * 在事务中执行 R2DBC 操作
+     * 执行查询并返回 Flow 流式结果
      */
-    suspend fun <T> connectionTransactional(
-        connectionFactory: ConnectionFactory,
-        block: suspend (io.r2dbc.spi.Connection) -> T
-    ): T {
-        val connection = connectionFactory.create().awaitSingle()
-        return try {
-            connection.beginTransaction().awaitSingle()
-            val result = block(connection)
-            connection.commitTransaction().awaitSingle()
-            result
-        } catch (e: Exception) {
-            connection.rollbackTransaction().awaitSingle()
-            throw e
-        } finally {
-            connection.close().awaitSingle()
+    protected inline fun <reified T : Any> fetchMany(sql: String, bind: Map<String, Any> = emptyMap()): Flow<T> {
+        var spec = databaseClient.sql(sql)
+        bind.forEach { (key, value) ->
+            spec = spec.bind(key, value)
         }
+        return spec.map { row, _ ->
+            mapRowToType<T>(row)
+        }.flow()
     }
+
+    /**
+     * 执行更新操作
+     */
+    protected suspend fun executeUpdate(sql: String, bind: Map<String, Any> = emptyMap()): Int {
+        var spec = databaseClient.sql(sql)
+        bind.forEach { (key, value) ->
+            spec = spec.bind(key, value)
+        }
+        return spec.fetch().awaitRowsUpdated()
+    }
+
+    /**
+     * 执行插入并返回生成的 ID
+     */
+    protected suspend fun executeInsert(sql: String, bind: Map<String, Any> = emptyMap()): Long? {
+        var spec = databaseClient.sql(sql)
+        bind.forEach { (key, value) ->
+            spec = spec.bind(key, value)
+        }
+        return spec.filter { statement ->
+            statement.returnGeneratedValues("id")
+        }.fetch().first()
+            .map { row -> row.get("id", Long::class.java) }
+            .awaitFirstOrNull()
+    }
+
+    /**
+     * 执行批量插入
+     */
+    protected suspend fun executeBatch(sql: String, binds: List<Map<String, Any>>): Int {
+        if (binds.isEmpty()) return 0
+
+        var spec = databaseClient.sql(sql)
+        binds.forEach { bind ->
+            spec = spec.bind(bind)
+        }
+        return spec.fetch().awaitRowsUpdated()
+    }
+
+    /**
+     * 执行原始 SQL
+     */
+    protected suspend fun execute(sql: String): Int {
+        return databaseClient.sql(sql)
+            .fetch()
+            .awaitRowsUpdated()
+    }
+
+    /**
+     * 类型映射方法 - 子类可以重写
+     */
+    protected abstract inline fun <reified T : Any> mapRowToType(row: org.springframework.r2dbc.core.Row): T
 }
 
 /**
@@ -194,5 +178,54 @@ object R2DBCExtensions {
      */
     fun buildCountQuery(baseQuery: String): String {
         return "SELECT COUNT(*) FROM ($baseQuery) AS count_query"
+    }
+
+    /**
+     * 构建 IN 子句
+     */
+    fun buildInClause(field: String, values: List<Any>): Pair<String, Map<String, Any>> {
+        if (values.isEmpty()) return "1=0" to emptyMap()
+
+        val params = values.mapIndexed { index, value ->
+            "${field}_$index" to value
+        }.toMap()
+
+        val placeholders = params.keys.joinToString(", ") { ":$it" }
+        return "$field IN ($placeholders)" to params
+    }
+
+    /**
+     * 构建动态 WHERE 子句
+     */
+    fun buildWhereClause(conditions: Map<String, Any?>): Pair<String, Map<String, Any>> {
+        val nonNullConditions = conditions.filterValues { it != null }
+        if (nonNullConditions.isEmpty()) return "" to emptyMap()
+
+        val clause = nonNullConditions.keys.joinToString(" AND ") { "$it = :$it" }
+        return "WHERE $clause" to nonNullConditions.mapValues { it.value!! }
+    }
+}
+
+/**
+ * R2DBC Transaction Helper
+ */
+class R2DBCTransactionManager(private val connectionFactory: ConnectionFactory) {
+
+    /**
+     * 在事务中执行操作
+     */
+    suspend fun <T> transactional(block: suspend () -> T): T {
+        val connection = connectionFactory.create().awaitSingle()
+        return try {
+            connection.beginTransaction().awaitSingle()
+            val result = block()
+            connection.commitTransaction().awaitSingle()
+            result
+        } catch (e: Exception) {
+            connection.rollbackTransaction().awaitSingle()
+            throw e
+        } finally {
+            connection.close().awaitSingle()
+        }
     }
 }

@@ -1,0 +1,140 @@
+.app-container {
+  display: flex;
+  height: 100vh;
+}
+
+.sidebar {
+  width: 240px;
+  background-color: #f5f5f5;
+  border-right: 1px solid #e0e0e0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.sidebar-header h2 {
+  margin: 0;
+  font-size: 20px;
+  color: #000;
+}
+
+.sidebar-menu {
+  flex: 1;
+  padding-top: 8px;
+}
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  text-decoration: none;
+  color: #333;
+  transition: background-color 0.2s;
+}
+
+.sidebar-item:hover {
+  background-color: #e8e8e8;
+}
+
+.sidebar-item.active {
+  background-color: #0066cc;
+  color: white;
+}
+
+.sidebar-icon {
+  margin-right: 12px;
+  display: flex;
+  align-items: center;
+}
+
+.sidebar-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.sidebar-title {
+  font-size: 14px;
+}
+
+.main-content {
+  flex: 1;
+  padding: 20px 40px;
+  overflow-y: auto;
+  background-color: #fff;
+}
+
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.agents-page,
+.channels-page,
+.models-page,
+.logs-page,
+.settings-page {
+  padding: 20px 0;
+}
+
+.logs-container {
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.logs-content {
+  margin: 0;
+  padding: 16px;
+  background-color: #f5f5f5;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.settings-card {
+  max-width: 600px;
+  padding: 24px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .sidebar {
+    background-color: #1a1a1a;
+    border-right-color: #333;
+  }
+
+  .sidebar-header {
+    border-bottom-color: #333;
+  }
+
+  .sidebar-header h2 {
+    color: #fff;
+  }
+
+  .sidebar-item {
+    color: #ccc;
+  }
+
+  .sidebar-item:hover {
+    background-color: #2d2d2d;
+  }
+
+  .sidebar-item.active {
+    background-color: #0066cc;
+    color: white;
+  }
+
+  .main-content {
+    background-color: #121212;
+    color: #fff;
+  }
+
+  .logs-content {
+    background-color: #1e1e1e;
+    color: #fff;
+  }
+}
