@@ -28,10 +28,10 @@ dependencies {
     implementation("ch.qos.logback:logback-classic:1.5.16")
     
     // Exposed - SQL Framework
-    implementation("org.jetbrains.exposed:exposed-core:0.58.0")
-    implementation("org.jetbrains.exposed:exposed-dao:0.58.0")
-    implementation("org.jetbrains.exposed:exposed-jdbc:0.58.0")
-    implementation("org.jetbrains.exposed:exposed-java-time:0.58.0")
+    implementation("org.jetbrains.exposed:exposed-core:1.1.1")
+    implementation("org.jetbrains.exposed:exposed-dao:1.1.1")
+    implementation("org.jetbrains.exposed:exposed-jdbc:1.1.1")
+    implementation("org.jetbrains.exposed:exposed-java-time:1.1.1")
     
     // R2DBC PostgreSQL
     implementation("org.postgresql:r2dbc-postgresql:1.0.7.RELEASE")
