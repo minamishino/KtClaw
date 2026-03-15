@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ktclaw:latest
+    container_name: ktclaw-app
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=production
+      - JAVA_OPTS=-Xmx512m -XX:+UseG1GC
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - ktclaw-network
+
+  # Optional: Add database service if needed
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: ktclaw-db
+  #   environment:
+  #     POSTGRES_DB: ktclaw
+  #     POSTGRES_USER: ktclaw
+  #     POSTGRES_PASSWORD: changeme
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   networks:
+  #     - ktclaw-network
+
+  # Optional: Add Redis cache if needed
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: ktclaw-redis
+  #   ports:
+  #     - "6379:6379"
+  #   networks:
+  #     - ktclaw-network
+
+networks:
+  ktclaw-network:
+    driver: bridge
+
+# volumes:
+#   postgres_data:

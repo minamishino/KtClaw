@@ -17,16 +17,16 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class WebSocketGateway {
     private val logger = LoggerFactory.getLogger(WebSocketGateway::class.java)
-    
+
     // 连接管理
     private val connections = ConcurrentHashMap<String, WebSocketConnection>()
     private val sessionCounter = AtomicLong(0)
-    
+
     // 按类型分组的连接
     private val agentConnections = ConcurrentHashMap<String, MutableSet<String>>() // agentId -> sessionIds
     private val userConnections = ConcurrentHashMap<String, MutableSet<String>>()   // userId -> sessionIds
     private val channelConnections = ConcurrentHashMap<String, MutableSet<String>>() // channelId -> sessionIds
-    
+
     /**
      * WebSocket 连接信息
      */
@@ -37,7 +37,7 @@ class WebSocketGateway {
         val entityId: String? = null,  // agentId, userId, or channelId
         val connectedAt: Long = System.currentTimeMillis()
     )
-    
+
     /**
      * 连接类型
      */
@@ -47,7 +47,7 @@ class WebSocketGateway {
         CHANNEL,    // 通道连接
         ADMIN       // 管理员连接
     }
-    
+
     /**
      * 注册 WebSocket 路由
      */
@@ -58,26 +58,26 @@ class WebSocketGateway {
                 val agentId = call.parameters["agentId"] ?: "unknown"
                 handleConnection(this, ConnectionType.AGENT, agentId)
             }
-            
+
             // 客户端 WebSocket 连接
             webSocket("/ws/client/{userId}") {
                 val userId = call.parameters["userId"] ?: "anonymous"
                 handleConnection(this, ConnectionType.CLIENT, userId)
             }
-            
+
             // 通道 WebSocket 连接
             webSocket("/ws/channel/{channelId}") {
                 val channelId = call.parameters["channelId"] ?: "default"
                 handleConnection(this, ConnectionType.CHANNEL, channelId)
             }
-            
+
             // 管理员 WebSocket 连接
             webSocket("/ws/admin") {
                 handleConnection(this, ConnectionType.ADMIN, "admin")
             }
         }
     }
-    
+
     /**
      * 处理新的 WebSocket 连接
      */
@@ -93,13 +93,13 @@ class WebSocketGateway {
             connectionType = type,
             entityId = entityId
         )
-        
+
         // 保存连接
         connections[sessionId] = connection
         registerConnectionByType(type, entityId, sessionId)
-        
+
         logger.info("WebSocket connected: sessionId=$sessionId, type=$type, entityId=$entityId")
-        
+
         // 发送连接成功消息
         sendMessage(sessionId, GatewayMessage(
             type = MessageType.CONNECTED,
@@ -109,7 +109,7 @@ class WebSocketGateway {
                 "timestamp" to System.currentTimeMillis()
             )
         ))
-        
+
         try {
             // 处理传入消息
             for (frame in session.incoming) {
@@ -130,7 +130,7 @@ class WebSocketGateway {
             disconnect(sessionId)
         }
     }
-    
+
     /**
      * 处理传入的消息
      */
@@ -138,9 +138,9 @@ class WebSocketGateway {
         try {
             val message = Json.decodeFromString<ClientMessage>(text)
             val connection = connections[sessionId]
-            
+
             logger.debug("Received message from $sessionId: type=${message.type}")
-            
+
             when (message.type) {
                 "ping" -> {
                     sendMessage(sessionId, GatewayMessage(
@@ -171,7 +171,7 @@ class WebSocketGateway {
             ))
         }
     }
-    
+
     /**
      * 断开连接
      */
@@ -182,7 +182,7 @@ class WebSocketGateway {
             logger.info("WebSocket disconnected: $sessionId")
         }
     }
-    
+
     /**
      * 发送消息到指定会话
      */
@@ -202,7 +202,7 @@ class WebSocketGateway {
             false
         }
     }
-    
+
     /**
      * 发送消息到指定 Agent
      */
@@ -214,7 +214,7 @@ class WebSocketGateway {
         }
         return sent
     }
-    
+
     /**
      * 发送消息到指定用户
      */
@@ -226,8 +226,11 @@ class WebSocketGateway {
         }
         return sent
     }
-    
+
     /**
      * 发送消息到指定通道
      */
-    suspend fun sendToChannel(channelId: String, message:
+    suspend fun sendToChannel(channelId: String, message: GatewayMessage): Int {
+        val sessionIds = channelConnections[channelId] ?: emptySet()
+        var sent = 0
+        for (sessionId in
