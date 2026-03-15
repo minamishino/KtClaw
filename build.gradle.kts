@@ -44,9 +44,6 @@ dependencies {
     // R2DBC Pool
     implementation("io.r2dbc:r2dbc-pool:1.0.2.RELEASE")
 
-    // Spring Data R2DBC (for DatabaseClient)
-    implementation("org.springframework.data:spring-data-r2dbc:3.4.0")
-
     // Koin - Dependency Injection
     implementation("io.insert-koin:koin-core:4.0.0")
     implementation("io.insert-koin:koin-ktor:4.0.0")

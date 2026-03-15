@@ -1,399 +1,228 @@
 package ktclaw.db.repository
 
-import ktclaw.db.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
+import io.r2dbc.spi.ConnectionFactory
+import io.r2dbc.spi.Row
+import ktclaw.db.MessageDTO
+import ktclaw.db.MessageStatus
+import ktclaw.db.MessageType
+import ktclaw.db.R2DBCDatabaseClient
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.toList
-import org.springframework.r2dbc.core.DatabaseClient
-import org.springframework.r2dbc.core.Row
+import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.UUID
 
 /**
  * Message Repository - 消息数据访问层
- * 使用 R2DBC DatabaseClient 实现，支持 suspend 函数和 Flow 流式查询
+ * 纯 Kotlin 实现，使用 R2DBC DatabaseClient
  */
-class MessageRepository(databaseClient: DatabaseClient) : R2DBCRepository(databaseClient) {
+class MessageRepository(connectionFactory: ConnectionFactory) {
+    private val logger = LoggerFactory.getLogger(MessageRepository::class.java)
+    private val dbClient = R2DBCDatabaseClient(connectionFactory)
 
     /**
      * 根据 ID 查询消息
      */
-    suspend fun findById(id: UUID): MessageDTO? = fetchOne(
-        """
-        SELECT m.*, s.session_key, c.channel_id as channel_external_id
-        FROM messages m
-        JOIN sessions s ON m.session_id = s.id
-        JOIN channels c ON m.channel_id = c.id
-        WHERE m.id = :id
-        """,
-        mapOf("id" to id)
-    )
+    suspend fun findById(id: UUID): MessageDTO? {
+        logger.debug("Finding message by id: $id")
+        return dbClient.fetchOne(
+            """
+            SELECT m.*, s.session_key, c.channel_id as channel_external_id
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            JOIN channels c ON m.channel_id = c.id
+            WHERE m.id = '$id'
+            """
+        ) { row -> mapRowToMessageDTO(row) }
+    }
 
     /**
      * 根据会话 ID 查询消息（分页）- 使用 Flow 进行流式查询
      */
-    fun findBySessionIdFlow(sessionId: UUID, limit: Int, offset: Int): Flow<MessageDTO> = fetchMany(
-        """
-        SELECT m.*, s.session_key, c.channel_id as channel_external_id
-        FROM messages m
-        JOIN sessions s ON m.session_id = s.id
-        JOIN channels c ON m.channel_id = c.id
-        WHERE m.session_id = :sessionId
-        ORDER BY m.created_at DESC
-        LIMIT :limit OFFSET :offset
-        """,
-        mapOf(
-            "sessionId" to sessionId,
-            "limit" to limit,
-            "offset" to offset
-        )
-    )
-
-    /**
-     * 根据会话 ID 查询消息（分页）- suspend 版本
-     */
-    suspend fun findBySessionId(sessionId: UUID, limit: Int, offset: Int): List<MessageDTO> {
-        return findBySessionIdFlow(sessionId, limit, offset).toList()
+    fun findBySessionIdFlow(sessionId: UUID, limit: Int, offset: Int): Flow<MessageDTO> {
+        logger.debug("Finding messages for session: $sessionId")
+        return dbClient.fetchMany(
+            """
+            SELECT m.*, s.session_key, c.channel_id as channel_external_id
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            JOIN channels c ON m.channel_id = c.id
+            WHERE m.session_id = '$sessionId'
+            ORDER BY m.created_at DESC
+            LIMIT $limit OFFSET $offset
+            """
+        ) { row -> mapRowToMessageDTO(row) }
     }
 
     /**
-     * 根据会话 ID 和角色查询消息 - 使用 Flow
+     * 根据消息 ID 查询（外部消息 ID）
      */
-    fun findBySessionIdAndRoleFlow(
-        sessionId: UUID,
-        role: MessageRole,
-        limit: Int
-    ): Flow<MessageDTO> = fetchMany(
-        """
-        SELECT m.*, s.session_key, c.channel_id as channel_external_id
-        FROM messages m
-        JOIN sessions s ON m.session_id = s.id
-        JOIN channels c ON m.channel_id = c.id
-        WHERE m.session_id = :sessionId AND m.role = :role
-        ORDER BY m.created_at DESC
-        LIMIT :limit
-        """,
-        mapOf(
-            "sessionId" to sessionId,
-            "role" to role.name,
-            "limit" to limit
-        )
-    )
-
-    /**
-     * 全文搜索消息内容 - 使用 Flow 流式返回
-     */
-    fun searchByContentFlow(keyword: String, limit: Int, offset: Int): Flow<MessageDTO> = fetchMany(
-        """
-        SELECT m.*, s.session_key, c.channel_id as channel_external_id
-        FROM messages m
-        JOIN sessions s ON m.session_id = s.id
-        JOIN channels c ON m.channel_id = c.id
-        WHERE m.content ILIKE :keyword
-        ORDER BY m.created_at DESC
-        LIMIT :limit OFFSET :offset
-        """,
-        mapOf(
-            "keyword" to "%$keyword%",
-            "limit" to limit,
-            "offset" to offset
-        )
-    )
-
-    /**
-     * 统计会话消息数量
-     */
-    suspend fun countBySessionId(sessionId: UUID): Long {
-        return fetchOne<Long>(
-            "SELECT COUNT(*) as count FROM messages WHERE session_id = :sessionId",
-            mapOf("sessionId" to sessionId)
-        ) ?: 0L
+    suspend fun findByMessageId(messageId: String): MessageDTO? {
+        logger.debug("Finding message by messageId: $messageId")
+        return dbClient.fetchOne(
+            """
+            SELECT m.*, s.session_key, c.channel_id as channel_external_id
+            FROM messages m
+            JOIN sessions s ON m.session_id = s.id
+            JOIN channels c ON m.channel_id = c.id
+            WHERE m.message_id = '$messageId'
+            """
+        ) { row -> mapRowToMessageDTO(row) }
     }
-
-    /**
-     * 获取某时间段内的消息统计 - 使用 Flow
-     */
-    fun getMessageStatsByDateRangeFlow(
-        startTime: Instant,
-        endTime: Instant
-    ): Flow<MessageStatDTO> = fetchMany(
-        """
-        SELECT DATE_TRUNC('day', created_at) as date, COUNT(*) as count
-        FROM messages
-        WHERE created_at BETWEEN :startTime AND :endTime
-        GROUP BY DATE_TRUNC('day', created_at)
-        ORDER BY date DESC
-        """,
-        mapOf(
-            "startTime" to startTime,
-            "endTime" to endTime
-        )
-    )
 
     /**
      * 保存消息
      */
-    suspend fun save(dto: MessageInsertDTO): UUID? {
-        val id = executeInsert(
+    suspend fun save(message: MessageDTO): MessageDTO {
+        logger.debug("Saving message: ${message.messageId}")
+        return if (message.id == null) {
+            insert(message)
+        } else {
+            update(message)
+        }
+    }
+
+    /**
+     * 插入新消息
+     */
+    private suspend fun insert(message: MessageDTO): MessageDTO {
+        val id = UUID.randomUUID()
+        val now = Instant.now()
+
+        dbClient.execute(
             """
-            INSERT INTO messages (
-                id, session_id, channel_id, message_id, reply_to_id, role, type,
-                content, content_encrypted, media_url, media_size, media_mime_type,
-                status, tokens_used, latency_ms, error_message, metadata, created_at, updated_at
-            ) VALUES (
-                gen_random_uuid(), :sessionId, :channelId, :messageId, :replyToId, :role, :type,
-                :content, :contentEncrypted, :mediaUrl, :mediaSize, :mediaMimeType,
-                :status, :tokensUsed, :latencyMs, :errorMessage, :metadata::jsonb, NOW(), NOW()
-            )
-            """,
-            mapOf(
-                "sessionId" to dto.sessionId,
-                "channelId" to dto.channelId,
-                "messageId" to dto.messageId,
-                "replyToId" to dto.replyToId,
-                "role" to dto.role.name,
-                "type" to dto.type.name,
-                "content" to dto.content,
-                "contentEncrypted" to dto.contentEncrypted,
-                "mediaUrl" to dto.mediaUrl,
-                "mediaSize" to dto.mediaSize,
-                "mediaMimeType" to dto.mediaMimeType,
-                "status" to dto.status.name,
-                "tokensUsed" to dto.tokensUsed,
-                "latencyMs" to dto.latencyMs,
-                "errorMessage" to dto.errorMessage,
-                "metadata" to dto.metadata.toJsonString()
-            )
+            INSERT INTO messages (id, session_id, channel_id, message_id, reply_to_id, role, type,
+                                content, content_encrypted, media_url, media_size, media_mime_type,
+                                status, tokens_used, latency_ms, error_message, created_at, updated_at, metadata)
+            VALUES ('$id', '${message.sessionId}', '${message.channelId}',
+                    ${message.messageId?.let { "'$it'" } ?: "NULL"},
+                    ${message.replyToId?.let { "'$it'" } ?: "NULL"},
+                    '${message.role}', '${message.type}',
+                    '${message.content.replace("'", "''")}',
+                    ${message.contentEncrypted}, 
+                    ${message.mediaUrl?.let { "'$it'" } ?: "NULL"},
+                    ${message.mediaSize ?: "NULL"},
+                    ${message.mediaMimeType?.let { "'$it'" } ?: "NULL"},
+                    '${message.status}', ${message.tokensUsed ?: "NULL"},
+                    ${message.latencyMs ?: "NULL"},
+                    ${message.errorMessage?.let { "'$it'" } ?: "NULL"},
+                    '$now', '$now', '${message.metadata}')
+            """
         )
-        return id?.let { UUID.nameUUIDFromBytes(it.toString().toByteArray()) }
+
+        return message.copy(id = id, createdAt = now, updatedAt = now)
     }
 
     /**
-     * 批量插入消息
+     * 更新消息
      */
-    suspend fun batchInsert(messages: List<MessageInsertDTO>): Int {
-        if (messages.isEmpty()) return 0
+    private suspend fun update(message: MessageDTO): MessageDTO {
+        val now = Instant.now()
 
-        val sql = """
-            INSERT INTO messages (
-                id, session_id, channel_id, message_id, reply_to_id, role, type,
-                content, content_encrypted, media_url, media_size, media_mime_type,
-                status, tokens_used, latency_ms, error_message, metadata, created_at, updated_at
-            ) VALUES (
-                gen_random_uuid(), :sessionId, :channelId, :messageId, :replyToId, :role, :type,
-                :content, :contentEncrypted, :mediaUrl, :mediaSize, :mediaMimeType,
-                :status, :tokensUsed, :latencyMs, :errorMessage, :metadata::jsonb, NOW(), NOW()
-            )
-        """
-
-        val binds = messages.map { dto ->
-            mapOf(
-                "sessionId" to dto.sessionId,
-                "channelId" to dto.channelId,
-                "messageId" to dto.messageId,
-                "replyToId" to dto.replyToId,
-                "role" to dto.role.name,
-                "type" to dto.type.name,
-                "content" to dto.content,
-                "contentEncrypted" to dto.contentEncrypted,
-                "mediaUrl" to dto.mediaUrl,
-                "mediaSize" to dto.mediaSize,
-                "mediaMimeType" to dto.mediaMimeType,
-                "status" to dto.status.name,
-                "tokensUsed" to dto.tokensUsed,
-                "latencyMs" to dto.latencyMs,
-                "errorMessage" to dto.errorMessage,
-                "metadata" to dto.metadata.toJsonString()
-            )
-        }
-
-        return executeBatch(sql, binds)
-    }
-
-    /**
-     * 软删除消息（标记为已删除）
-     */
-    suspend fun softDelete(messageIds: List<UUID>): Int {
-        if (messageIds.isEmpty()) return 0
-
-        val placeholders = messageIds.indices.joinToString(",") { ":id$it" }
-        val params = messageIds.mapIndexed { index, id -> "id$index" to id }.toMap()
-
-        return executeUpdate(
-            "UPDATE messages SET status = 'DELETED', updated_at = NOW() WHERE id IN ($placeholders)",
-            params
+        dbClient.execute(
+            """
+            UPDATE messages
+            SET status = '${message.status}',
+                tokens_used = ${message.tokensUsed ?: "NULL"},
+                latency_ms = ${message.latencyMs ?: "NULL"},
+                error_message = ${message.errorMessage?.let { "'$it'" } ?: "NULL"},
+                updated_at = '$now',
+                metadata = '${message.metadata}'
+            WHERE id = '${message.id}'
+            """
         )
-    }
 
-    /**
-     * 清理过期消息
-     */
-    suspend fun cleanupOldMessages(beforeTime: Instant): Int {
-        return executeUpdate(
-            "DELETE FROM messages WHERE created_at < :beforeTime",
-            mapOf("beforeTime" to beforeTime)
-        )
-    }
-
-    /**
-     * 获取热门会话（消息最多的会话）- 使用并行查询
-     */
-    suspend fun getTopSessions(limit: Int = 10): List<Pair<UUID, Long>> = coroutineScope {
-        val result = async {
-            fetchMany<Pair<UUID, Long>>(
-                """
-                SELECT session_id, COUNT(*) as count
-                FROM messages
-                GROUP BY session_id
-                ORDER BY count DESC
-                LIMIT :limit
-                """,
-                mapOf("limit" to limit)
-            ).toList()
-        }
-        result.await()
-    }
-
-    /**
-     * 获取消息类型分布 - 使用并行查询
-     */
-    suspend fun getMessageTypeDistribution(): Map<MessageType, Long> = coroutineScope {
-        val result = async {
-            fetchMany<Pair<MessageType, Long>>(
-                """
-                SELECT type, COUNT(*) as count
-                FROM messages
-                GROUP BY type
-                """
-            ).toList().toMap()
-        }
-        result.await()
+        return message.copy(updatedAt = now)
     }
 
     /**
      * 更新消息状态
      */
-    suspend fun updateStatus(messageId: UUID, status: MessageStatus): Int {
-        return executeUpdate(
-            "UPDATE messages SET status = :status, updated_at = NOW() WHERE id = :id",
-            mapOf("id" to messageId, "status" to status.name)
+    suspend fun updateStatus(messageId: UUID, status: MessageStatus) {
+        logger.debug("Updating message status: $messageId -> $status")
+        dbClient.execute(
+            """
+            UPDATE messages
+            SET status = '$status', updated_at = '${Instant.now()}'
+            WHERE id = '$messageId'
+            """
         )
     }
 
     /**
-     * 更新消息 token 使用量
+     * 批量更新消息状态
      */
-    suspend fun updateTokenUsage(messageId: UUID, tokensUsed: Int, latencyMs: Int): Int {
-        return executeUpdate(
+    suspend fun updateStatusBatch(messageIds: List<UUID>, status: MessageStatus) {
+        if (messageIds.isEmpty()) return
+        
+        logger.debug("Batch updating message status for ${messageIds.size} messages")
+        val ids = messageIds.joinToString(",") { "'$it'" }
+        
+        dbClient.execute(
             """
-            UPDATE messages 
-            SET tokens_used = :tokensUsed, latency_ms = :latencyMs, updated_at = NOW() 
-            WHERE id = :id
-            """,
-            mapOf(
-                "id" to messageId,
-                "tokensUsed" to tokensUsed,
-                "latencyMs" to latencyMs
-            )
+            UPDATE messages
+            SET status = '$status', updated_at = '${Instant.now()}'
+            WHERE id IN ($ids)
+            """
         )
     }
 
-    @Suppress("UNCHECKED_CAST")
-    override inline fun <reified T : Any> mapRowToType(row: Row): T {
-        return when (T::class) {
-            MessageDTO::class -> MessageDTO(
-                id = row.get("id", UUID::class.java)!!,
-                sessionId = row.get("session_id", UUID::class.java)!!,
-                channelId = row.get("channel_id", UUID::class.java)!!,
-                messageId = row.get("message_id", String::class.java),
-                replyToId = row.get("reply_to_id", UUID::class.java),
-                role = MessageRole.valueOf(row.get("role", String::class.java)!!),
-                type = MessageType.valueOf(row.get("type", String::class.java)!!),
-                content = row.get("content", String::class.java)!!,
-                contentEncrypted = row.get("content_encrypted", Boolean::class.java) ?: false,
-                mediaUrl = row.get("media_url", String::class.java),
-                mediaSize = row.get("media_size", Long::class.java),
-                mediaMimeType = row.get("media_mime_type", String::class.java),
-                status = MessageStatus.valueOf(row.get("status", String::class.java)!!),
-                tokensUsed = row.get("tokens_used", Int::class.java),
-                latencyMs = row.get("latency_ms", Int::class.java),
-                errorMessage = row.get("error_message", String::class.java),
-                createdAt = row.get("created_at", Instant::class.java)!!,
-                updatedAt = row.get("updated_at", Instant::class.java)!!,
-                metadata = row.get("metadata", String::class.java)?.fromJson() ?: emptyMap()
-            ) as T
-
-            MessageStatDTO::class -> MessageStatDTO(
-                date = row.get("date", Instant::class.java)!!,
-                count = row.get("count", Long::class.java) ?: 0L
-            ) as T
-
-            Pair::class -> {
-                val first = row.get("session_id", UUID::class.java)
-                    ?: row.get("type", String::class.java)?.let { MessageType.valueOf(it) }
-                val second = row.get("count", Long::class.java) ?: 0L
-                (first to second) as T
-            }
-
-            else -> throw IllegalArgumentException("Unknown type: ${T::class}")
-        }
+    /**
+     * 统计会话的消息数
+     */
+    suspend fun countBySessionId(sessionId: UUID): Long {
+        val result = dbClient.fetchOne(
+            """
+            SELECT COUNT(*) as count
+            FROM messages
+            WHERE session_id = '$sessionId'
+            """
+        ) { row -> row.get("count", Long::class.java) }
+        return result ?: 0L
     }
-}
 
-data class MessageStatDTO(
-    val date: Instant,
-    val count: Long
-)
-
-data class MessageInsertDTO(
-    val sessionId: UUID,
-    val channelId: UUID,
-    val messageId: String? = null,
-    val replyToId: UUID? = null,
-    val role: MessageRole,
-    val type: MessageType = MessageType.TEXT,
-    val content: String,
-    val contentEncrypted: Boolean = false,
-    val mediaUrl: String? = null,
-    val mediaSize: Long? = null,
-    val mediaMimeType: String? = null,
-    val status: MessageStatus = MessageStatus.SENT,
-    val tokensUsed: Int? = null,
-    val latencyMs: Int? = null,
-    val errorMessage: String? = null,
-    val metadata: Map<String, Any> = emptyMap()
-)
-
-// JSON 扩展函数
-private fun Map<String, Any>.toJsonString(): String {
-    return kotlinx.serialization.json.Json.encodeToString(
-        kotlinx.serialization.builtins.MapSerializer(
-            String.serializer(),
-            kotlinx.serialization.json.JsonElement.serializer()
-        ),
-        this.mapValues {
-            when (val v = it.value) {
-                is String -> kotlinx.serialization.json.JsonPrimitive(v)
-                is Number -> kotlinx.serialization.json.JsonPrimitive(v)
-                is Boolean -> kotlinx.serialization.json.JsonPrimitive(v)
-                else -> kotlinx.serialization.json.JsonPrimitive(v.toString())
-            }
-        }
-    )
-}
-
-@Suppress("UNCHECKED_CAST")
-private fun String.fromJson(): Map<String, Any> {
-    val element = kotlinx.serialization.json.Json.parseToJsonElement(this)
-    return element.jsonObject.mapValues {
-        when (val v = it.value) {
-            is kotlinx.serialization.json.JsonPrimitive -> {
-                if (v.isString) v.content
-                else v.booleanOrNull ?: v.longOrNull ?: v.doubleOrNull ?: v.content
-            }
-            else -> v.toString()
-        }
+    /**
+     * 统计会话的 Token 使用量
+     */
+    suspend fun sumTokensBySessionId(sessionId: UUID): Int {
+        val result = dbClient.fetchOne(
+            """
+            SELECT COALESCE(SUM(tokens_used), 0) as total
+            FROM messages
+            WHERE session_id = '$sessionId' AND tokens_used IS NOT NULL
+            """
+        ) { row -> row.get("total", Int::class.java) }
+        return result ?: 0
     }
-}
+
+    /**
+     * 删除消息（软删除）
+     */
+    suspend fun softDelete(messageId: UUID) {
+        logger.debug("Soft deleting message: $messageId")
+        dbClient.execute(
+            """
+            UPDATE messages
+            SET status = 'DELETED', updated_at = '${Instant.now()}'
+            WHERE id = '$messageId'
+            """
+        )
+    }
+
+    /**
+     * 将数据库行映射为 MessageDTO
+     */
+    private fun mapRowToMessageDTO(row: Row): MessageDTO {
+        return MessageDTO(
+            id = row.get("id", UUID::class.java),
+            sessionId = row.get("session_id", UUID::class.java),
+            channelId = row.get("channel_id", UUID::class.java),
+            messageId = row.get("message_id", String::class.java),
+            replyToId = row.get("reply_to_id", UUID::class.java),
+            role = row.get("role", String::class.java) ?: "user",
+            type = MessageType.valueOf(row.get("type", String::class.java) ?: "TEXT"),
+            content = row.get("content", String::class.java) ?: "",
+            contentEncrypted = row.get("content_encrypted", Boolean::class.java) ?: false,
+            mediaUrl = row.get("media_url", String::class.java),
+            mediaSize
